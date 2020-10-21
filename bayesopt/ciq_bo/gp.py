@@ -40,11 +40,7 @@ class GP(ExactGP):
         self.jitter = jitter
         self.ard_dims = ard_dims
         kernel = KMaternKernel if use_keops else MaternKernel
-        base_covar_module = kernel(
-            lengthscale_constraint=LENGTHSCALE_BOUNDS,
-            nu=2.5,
-            ard_num_dims=ard_dims,
-        )
+        base_covar_module = kernel(lengthscale_constraint=LENGTHSCALE_BOUNDS, nu=2.5, ard_num_dims=ard_dims)
         self.covar_module = ScaleKernel(base_covar_module, outputscale_constraint=SIGNAL_VAR_BOUNDS)
 
     def forward(self, x):

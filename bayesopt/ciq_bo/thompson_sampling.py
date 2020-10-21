@@ -35,7 +35,7 @@ class ThompsonSampling:
 
         Parameters
         ----------
-        f : function handle that returns torch.tensor that we can call .item() on.
+        f : function handle that returns a float.
         lb : Lower variable bounds, torch.Tensor, shape (d,).
         ub : Upper variable bounds, torch.Tensor, shape (d,).
         n_init : Number of initial points, int.
@@ -132,14 +132,14 @@ class ThompsonSampling:
 
         # Generate and evalute initial design points
         self.X = self.lb + (self.ub - self.lb) * latin_hypercube(self.n_init, self.dim, dtype=dtype, device=device)
-        self.fX = torch.tensor([self.f(x).item() for x in self.X], dtype=dtype, device=device).unsqueeze(-1)
+        self.fX = torch.tensor([self.f(x) for x in self.X], dtype=dtype, device=device).unsqueeze(-1)
         self.n_evals += self.n_init
 
         # Adaptive phase
         while self.n_evals < self.max_evals:
             # Create and evaluate batch
             X_next = self.make_batch()
-            fX_next = torch.tensor([self.f(x).item() for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
+            fX_next = torch.tensor([self.f(x) for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
 
             # Update budget and append data
             self.n_evals += self.batch_size
