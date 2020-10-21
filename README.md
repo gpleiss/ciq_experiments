@@ -15,7 +15,6 @@ by Geoff Pleiss, Martin Jankowiak, David Eriksson, Anil Damle, and Jacob R. Gard
  - scikit-learn
  - tqdm
  - pandas
- - a GPU
 
 
 ## SVGP experiments
@@ -33,6 +32,15 @@ python uci_regression.py -d 3droad  -vs standard --likelihood gaussian  --num-in
 python uci_regression.py -d precip  -vs standard --likelihood studentt  --num-ind 2000 --batch-size 256 -lr 0.005 -vlr 0.005
 python uci_regression.py -d covtype -vs standard --likelihood bernoulli --num-ind 2000 --batch-size 512 
 ```
+
+
+## BayesOpt experiments
+A notebook to reproduce the Hartmann6D experiment is in the `bayesopt` folder.
+It requires the additional packages
+- BoTorch
+- PyKeOps
+- JuPyter
+- Matplotlib
 
 
 ## Super-resolution experiments
