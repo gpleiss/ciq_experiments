@@ -30,11 +30,6 @@ from custom_loader import BatchDataloader
 from util import AverageMeter
 
 
-objective_functions = {
-    "svgp": gpytorch.mlls.VariationalELBO,
-    "ppgpr": gpytorch.mlls.PredictiveLogLikelihood,
-}
-
 likelihoods = {
     "beta": gpytorch.likelihoods.BetaLikelihood,
     "bernoulli": gpytorch.likelihoods.BernoulliLikelihood,
@@ -51,17 +46,16 @@ def do_eval(model, likelihood, loader, targets, args):
     all_means, all_vars = [], []
     log_prob = 0.0
 
-    with gpytorch.settings.max_cg_iterations(args["num_minres_iter"]), gpytorch.settings.minres_tolerance(args["minres_tol"]):
+    with gpytorch.settings.max_cg_iterations(1000), gpytorch.settings.minres_tolerance(args["minres_tol"]):
         with gpytorch.settings.num_contour_quadrature(args["num_quad"]):
-            with gpytorch.settings.min_preconditioning_size(1), gpytorch.settings.max_preconditioner_size(args["preconditioner"]):
-                with gpytorch.settings.single_precision_cholesky(args["precision"] == "single"):
-                    with gpytorch.settings.eval_cg_tolerance(args["cg_tol"]), gpytorch.settings.cg_tolerance(args["cg_tol"]):
-                        with gpytorch.settings.num_likelihood_samples(100):
-                            for x_batch, y_batch in loader:
-                                latent_dist = model(x_batch)
-                                mean, var = latent_dist.mean.cpu(), latent_dist.variance.cpu()
-                                all_means.append(mean), all_vars.append(var)
-                                log_prob += likelihood.log_marginal(y_batch.type_as(x_batch), latent_dist).sum().item()
+            with gpytorch.settings.max_preconditioner_size(0):
+                with gpytorch.settings.eval_cg_tolerance(args["cg_tol"]), gpytorch.settings.cg_tolerance(args["cg_tol"]):
+                    with gpytorch.settings.num_likelihood_samples(100):
+                        for x_batch, y_batch in loader:
+                            latent_dist = model(x_batch)
+                            mean, var = latent_dist.mean.cpu(), latent_dist.variance.cpu()
+                            all_means.append(mean), all_vars.append(var)
+                            log_prob += likelihood.log_marginal(y_batch.type_as(x_batch), latent_dist).sum().item()
 
     # Aggregate results
     means = torch.cat(all_means)
@@ -108,17 +102,12 @@ def main(**args):
             args["num_epochs"] = 400
 
     # NGD if we have a natural vd:
-    if "natural" in args["variational_distribution"]:
-        if args["variational_strategy"] != "ciq":
-            args["variational_distribution"] = "natural_slow"
-        args["optim"] = "ngd"
-
     log_file = (
-        f"{args['dataset']}.{args['model']}{'_grid' if args['grid'] else ''}.{args['variational_strategy']}.{args['variational_distribution']}"
-        f".lik_{args['likelihood']}.precond_{args['preconditioner']}"
-        f".ni_{args['num_ind']}.noi_{args['num_orth_ind']}.bs_{args['batch_size']}.nmi_{args['num_minres_iter']}.pr_{args['precision']}"
-        f".cgtol_{args['cg_tol']}.nq_{args['num_quad']}.beta_{args['beta']:.2f}"
-        f".nepochs_{args['num_epochs']}.lr_{args['lr']}.vlr_{args['vlr']}.vg_{args['gamma']}.b1_{args['b1']}.optim_{args['optim']}"
+        f"{args['dataset']}.{args['variational_strategy']}"
+        f".lik_{args['likelihood']}"
+        f".ni_{args['num_ind']}.bs_{args['batch_size']}.nmi_{args['num_minres_iter']}"
+        f".cgtol_{args['cg_tol']}.nq_{args['num_quad']}"
+        f".nepochs_{args['num_epochs']}.lr_{args['lr']}.vlr_{args['vlr']}.vg_{args['gamma']}.b1_{args['b1']}"
         f".seed_{args['seed']}.ns_{args['num_splits']}.nr_{args['num_restarts']}.{str(uuid.uuid4())[:4]}.log"
     )
     log = get_logger(args["log_dir"], log_file, use_local_logger=False)
@@ -136,13 +125,6 @@ def main(**args):
         train_x, train_y, test_x, test_y, valid_x, valid_y, y_std = load_uci_data(
             args["data_dir"], args["dataset"], args["seed"] + split
         )
-        if args["precision"] == "double":
-            train_x = train_x.double()
-            train_y = train_y.double()
-            test_x = test_x.double()
-            test_y = test_y.double()
-            valid_x = valid_x.double()
-            valid_y = valid_y.double()
         N_train = train_x.size(0)
         all_results["N_train"] = N_train
         all_results["N_test"] = test_x.size(0)
@@ -175,81 +157,41 @@ def main(**args):
                     set_seed(args["seed"])
 
             # Constuct inducing points from k_means
-            if args["grid"]:
-                num_dim = train_x.size(-1)
-                m_per_dim = math.floor(args["num_ind"] ** (1. / num_dim))
-                grid_bounds = list(zip(train_x.min(dim=0)[0].tolist(), train_x.max(dim=0)[0].tolist()))
-                grid = gpytorch.utils.grid.create_grid([m_per_dim] * num_dim, grid_bounds, extend=True)
-                inducing_points = gpytorch.utils.grid.create_data_from_grid(grid).cuda()
-            else:
-                inducing_points = train_x[torch.randperm(min(1000 * 100, N_train))[:args["num_ind"]], :]
-                inducing_points = inducing_points.clone().data.cpu().numpy()
-                inducing_points = torch.tensor(
-                    kmeans2(train_x.data.cpu().numpy(), inducing_points, minit="matrix")[0]
-                ).cuda()
-                inducing_points.add_(torch.rand_like(inducing_points).mul(0.05))
-                grid = None
-
-            # Mean inducing points, if we're doing orthogonal decoupled SVGP
-            if args["num_orth_ind"]:
-                orth_inducing_points = train_x[torch.randperm(min(1000 * 100, N_train))[:args["num_orth_ind"]], :]
-                orth_inducing_points = orth_inducing_points.clone().data.cpu().numpy()
-                orth_inducing_points = torch.tensor(
-                    kmeans2(train_x.data.cpu().numpy(), orth_inducing_points, minit="matrix")[0]
-                ).cuda()
-            else:
-                orth_inducing_points = None
+            inducing_points = train_x[torch.randperm(min(1000 * 100, N_train))[:args["num_ind"]], :]
+            inducing_points = inducing_points.clone().data.cpu().numpy()
+            inducing_points = torch.tensor(
+                kmeans2(train_x.data.cpu().numpy(), inducing_points, minit="matrix")[0]
+            ).cuda()
+            inducing_points.add_(torch.rand_like(inducing_points).mul(0.05))
 
             # Construct likelihood and model
             likelihood = likelihoods[args["likelihood"]]().cuda()
             model = ApproximateSingleLayerGP(
                 inducing_points,
                 vs_class=args["variational_strategy"],
-                vd_class=args["variational_distribution"],
-                grid=grid,
-                orth_inducing_points=orth_inducing_points
             ).cuda()
-            if args["precision"] == "double":
-                likelihood = likelihood.double()
-                model = model.double()
             log(model)
 
             # Adjust the initial lengthscale for low-D datasets
-            if args["dataset"] in ["3droad", "housing", "precip"]:
+            if args["dataset"] in ["3droad", "precip"]:
                 model.covar_module.base_kernel.initialize(lengthscale=0.01)
-            elif args["dataset"] in ["airline" or "covtype"]:
+            elif args["dataset"] in ["covtype"]:
                 model.covar_module.base_kernel.initialize(lengthscale=0.1)
 
             # Objective and optimizer
-            objective = objective_functions[args["model"]](likelihood, model, num_data=train_y.size(0), combine_terms=False)
-            if args["num_orth_ind"]:
-                variational_params = list(model.variational_strategy.base_variational_strategy._variational_distribution.parameters())
-                orth_params = list(model.variational_strategy._variational_distribution.parameters())
-            else:
-                variational_params = list(model.variational_strategy._variational_distribution.parameters())
-                orth_params = []
-            other_params = list(set(model.parameters()) - set(variational_params) - set(orth_params))
+            objective = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=train_y.size(0), combine_terms=False)
+            variational_params = list(model.variational_strategy._variational_distribution.parameters())
+            other_params = list(set(model.parameters()) - set(variational_params))
             for param in variational_params:
                 print("vp", param.shape)
             for param in other_params:
                 print("op", param.shape)
 
-            if args["optim"] == "adam":
-                optim = torch.optim.Adam([
-                    {"params": variational_params, "lr": args["vlr"]}, {"params": orth_params, "lr": args["olr"]},
-                    {"params": other_params}, {"params": likelihood.parameters()}
-                ], lr=args["lr"], betas=(args["b1"], 0.999))
-            elif args["optim"] == "ngd":
-                optim = torch.optim.Adam(
-                    [{"params": other_params}, {"params": likelihood.parameters()}, {"params": orth_params, "lr": args["olr"]}],
-                    lr=args["lr"], betas=(args["b1"], 0.999)
-                )
-                optim_var = torch.optim.SGD(variational_params, lr=args["vlr"])
-            else:
-                optim = torch.optim.SGD([
-                    {"params": variational_params, "lr": args["vlr"]}, {"params": orth_params, "lr": args["olr"]},
-                    {"params": other_params}, {"params": likelihood.parameters()}
-                ], lr=args["lr"])
+            optim = torch.optim.Adam(
+                [{"params": other_params}, {"params": likelihood.parameters()}],
+                lr=args["lr"], betas=(args["b1"], 0.999)
+            )
+            optim_var = gpytorch.optim.NGD(variational_params, lr=args["vlr"], num_data=train_y.size(0))
             sched = torch.optim.lr_scheduler.MultiStepLR(optim, milestones=args["milestones"], gamma=args["gamma"])
 
             # Prep for training
@@ -266,75 +208,65 @@ def main(**args):
             for i in epochs_iter:
                 # For recording stats
                 if args["likelihood"] == "bernoulli":
-                    stats = ["enll", "kl", "err", "os", "res", "k2", "ciq_diff", "nmi"]
+                    stats = ["enll", "kl", "err", "os"]
                 else:
-                    stats = ["enll", "kl", "rmse", "os", "noise", "nu", "res", "k2", "ciq_diff", "nmi"]
+                    stats = ["enll", "kl", "rmse", "os", "noise", "nu"]
                 meters = [AverageMeter() for _ in stats]
                 tqdm_train_loader = tqdm.tqdm(train_loader, desc=f"Epoch {i + 1}", leave=False)
                 start = time.time()
 
                 # Training loop
-                with gpytorch.settings.max_cg_iterations(args["num_minres_iter"]), gpytorch.settings.minres_tolerance(args["minres_tol"]):
-                    with gpytorch.settings.min_preconditioning_size(1), gpytorch.settings.max_preconditioner_size(args["preconditioner"]):
+                with gpytorch.settings.max_cg_iterations(1000), gpytorch.settings.minres_tolerance(args["minres_tol"]):
+                    with gpytorch.settings.max_preconditioner_size(0):
                         with gpytorch.settings.num_contour_quadrature(args["num_quad"]):
-                            with gpytorch.settings.single_precision_cholesky(args["precision"] == "single"):
-                                with gpytorch.settings.cg_tolerance(args["cg_tol"]):
-                                    for x_batch, y_batch in tqdm_train_loader:
-                                        if args["optim"] == "ngd":
-                                            optim.zero_grad()
-                                            optim_var.zero_grad()
-                                            output = model(x_batch)
-                                            ell, kl, _ = objective(output, y_batch)
-                                            loss = -ell + kl
-                                            (loss * objective.num_data).backward()
-                                            optim_var.step()
+                            with gpytorch.settings.cg_tolerance(args["cg_tol"]):
+                                for x_batch, y_batch in tqdm_train_loader:
+                                    optim.zero_grad()
+                                    optim_var.zero_grad()
+                                    output = model(x_batch)
+                                    ell, kl, _ = objective(output, y_batch)
+                                    loss = -ell + kl
+                                    loss.backward()
+                                    optim_var.step()
 
-                                        optim.zero_grad()
-                                        output = model(x_batch)
-                                        ell, kl, _ = objective(output, y_batch)
-                                        loss = -ell + kl
-                                        loss.backward()
-                                        optim.step()
+                                    optim.zero_grad()
+                                    output = model(x_batch)
+                                    ell, kl, _ = objective(output, y_batch)
+                                    loss = -ell + kl
+                                    loss.backward()
+                                    optim.step()
 
 
-                                        # Measure and record stats
-                                        batch_size = x_batch.size(0)
-                                        if args["likelihood"] == "bernoulli":
-                                            # Compute RMSE
-                                            with torch.no_grad():
-                                                err = (output.mean.gt(0) != y_batch.bool()).float().mean()
-                                            stat_vals = [
-                                                -ell.item(),
-                                                kl.item(),
-                                                err.item(),
-                                                model.covar_module.outputscale.mean().item(),
-                                                gpytorch.settings.record_ciq_stats.minres_residual,
-                                                gpytorch.settings.record_ciq_stats.condition_number,
-                                                gpytorch.settings.record_ciq_stats.ciq_diff,
-                                                gpytorch.settings.record_ciq_stats.num_minres_iter,
-                                            ]
-                                        else:
-                                            # Compute RMSE
-                                            with torch.no_grad():
-                                                rmse = (y_batch - output.mean).pow(2).mean(0).sqrt()
-                                            stat_vals = [
-                                                -ell.item(),
-                                                kl.item(),
-                                                rmse.item(),
-                                                model.covar_module.outputscale.mean().item(),
-                                                likelihood.noise.item() if args["likelihood"] not in ["beta", "bernoulli"] else 0.,
-                                                likelihood.deg_free.item() if args["likelihood"] == "studentt" else 0.,
-                                                gpytorch.settings.record_ciq_stats.minres_residual,
-                                                gpytorch.settings.record_ciq_stats.condition_number,
-                                                gpytorch.settings.record_ciq_stats.ciq_diff,
-                                                gpytorch.settings.record_ciq_stats.num_minres_iter,
-                                            ]
-                                        for stat_val, meter in zip(stat_vals, meters):
-                                            meter.update(stat_val, batch_size)
+                                    # Measure and record stats
+                                    batch_size = x_batch.size(0)
+                                    if args["likelihood"] == "bernoulli":
+                                        # Compute RMSE
+                                        with torch.no_grad():
+                                            err = (output.mean.gt(0) != y_batch.bool()).float().mean()
+                                        stat_vals = [
+                                            -ell.item(),
+                                            kl.item(),
+                                            err.item(),
+                                            model.covar_module.outputscale.mean().item(),
+                                        ]
+                                    else:
+                                        # Compute RMSE
+                                        with torch.no_grad():
+                                            rmse = (y_batch - output.mean).pow(2).mean(0).sqrt()
+                                        stat_vals = [
+                                            -ell.item(),
+                                            kl.item(),
+                                            rmse.item(),
+                                            model.covar_module.outputscale.mean().item(),
+                                            likelihood.noise.item() if args["likelihood"] not in ["beta", "bernoulli"] else 0.,
+                                            likelihood.deg_free.item() if args["likelihood"] == "studentt" else 0.,
+                                        ]
+                                    for stat_val, meter in zip(stat_vals, meters):
+                                        meter.update(stat_val, batch_size)
 
-                                        # Print stats
-                                        res = dict((name, f"{meter.val:.3f}") for name, meter in zip(stats, meters))
-                                        tqdm_train_loader.set_postfix(**res)
+                                    # Print stats
+                                    res = dict((name, f"{meter.val:.3f}") for name, meter in zip(stats, meters))
+                                    tqdm_train_loader.set_postfix(**res)
 
                 # Wrap up epoch
                 ts.append(time.time() - start)
@@ -473,32 +405,23 @@ if __name__ == "__main__":
 
     # Dataset and model type
     parser.add_argument("-d", "--dataset", type=str, default="3droad")
-    parser.add_argument("-m", "--model", type=str, default="svgp", choices=["svgp", "ppgpr"])
-    parser.add_argument("-g", "--grid", type=bool, default=False)
     parser.add_argument("-l", "--likelihood", type=str, default="gaussian", choices=["beta", "gaussian", "laplace", "studentt", "bernoulli"])
-    parser.add_argument("-vs", "--variational_strategy", type=str, default="standard", choices=["standard", "ciq", "eig", "eigqr"])
-    parser.add_argument("-vd", "--variational_distribution", type=str, default="natural", choices=["delta", "mf", "mf_decoupled", "cholesky", "natural_slow", "natural"])
+    parser.add_argument("-vs", "--variational_strategy", type=str, default="standard", choices=["standard", "ciq"])
 
     # Model args
     parser.add_argument("-ni", "--num-ind", type=int, default=1000)
-    parser.add_argument("-noi", "--num-orth-ind", type=int, default=0)
     parser.add_argument("-bs", "--batch-size", type=int, default=256)
-    parser.add_argument("-p", "--preconditioner", type=int, default=0)
     parser.add_argument("-nmi", "--num-minres-iter", type=int, default=200)
     parser.add_argument("-mt", "--minres-tol", type=float, default=1e-4)
     parser.add_argument("-nq", "--num-quad", type=int, default=15)
     parser.add_argument("-cg", "--cg-tol", type=float, default=0.001)
-    parser.add_argument("-pr", "--precision", type=str, default="single")
-    parser.add_argument("-beta", "--beta", type=float, default=1.)
 
     # Training args
     parser.add_argument("-n", "--num-epochs", type=int, default=0)
     parser.add_argument("-lr", "--lr", type=float, default=0.01)
     parser.add_argument("-b1", "--b1", type=float, default=0.90)
-    parser.add_argument("-olr", "--olr", type=float, default=0.001)
     parser.add_argument("-vlr", "--vlr", type=float, default=0.1)
     parser.add_argument("-gamma", "--gamma", type=float, default=0.1)
-    parser.add_argument("-o", "--optim", type=str, default="adam", choices=["adam", "sgd", "ngd"])
 
     # Seed/splits/restarts
     parser.add_argument("-s", "--seed", type=int, default=0)
