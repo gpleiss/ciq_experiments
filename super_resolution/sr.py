@@ -17,9 +17,8 @@ from gpytorch.utils import linear_cg
 @torch.no_grad()
 def mvn_sample(prec, minres_tol=1.0e-5, num_quad=15, num_cg_iter=1000):
     epsilon = torch.randn(prec.size(0), dtype=prec.dtype, device=prec.device)
-    with gpytorch.settings.minres_tolerance(minres_tol), gpytorch.settings.record_ciq_stats(), \
-         gpytorch.settings.num_contour_quadrature(num_quad), gpytorch.settings.max_cg_iterations(num_cg_iter):
-            return prec.sqrt_inv_matmul(epsilon)
+    with gpytorch.settings.minres_tolerance(minres_tol), gpytorch.settings.num_contour_quadrature(num_quad), gpytorch.settings.max_cg_iterations(num_cg_iter):
+        return prec.sqrt_inv_matmul(epsilon)
 
 # inverse matmul helper
 @torch.no_grad()
@@ -221,9 +220,6 @@ def do_gibbs(lr_imgs=None, ds_blur_mat=None, N=None, M=None,
         prec = NonLazyTensor(ds_blur_prec + (gamma_pr / gamma_obs) * laplace_prec)
         mean = inv_matmul(upsampled_image, prec)
         x_new = mvn_sample(prec) / math.sqrt(gamma_obs) + mean
-        minres_residual = gpytorch.settings.record_ciq_stats.minres_residual
-        if minres_residual > 1.0e-3:
-            print("minres_residual: {:.4f}".format(minres_residual))
 
         # keep x sample for next iteration
         x_history.append(x_new.cpu())
